@@ -5,6 +5,7 @@ const fs = require('fs');
 const path = require('path');
 const blessed = require('blessed');
 const puppeteer = require('puppeteer-core');
+const agents = require('./agents'); // DODANO: Uvoz nove liste s imenima uređaja
 
 /* CONFIG */
 const CHROMIUM = '/data/data/com.termux/files/usr/bin/chromium-browser';
@@ -15,7 +16,6 @@ const LOG_FILE = path.join(__dirname, 'nps-log-' + dateStr + '.jsonl');
 const JSON_FILE = path.join(__dirname, 'nps-data-' + dateStr + '.json');
 const CSV_FILE = path.join(__dirname, 'nps-data-' + dateStr + '.csv');
 const SHOTS_DIR = '/storage/emulated/0/Download/Userland/gls-scraper/shots';
-const MOBILE_UA = 'Mozilla/5.0 (Linux; Android 12; SM-G920F) AppleWebKit/537.36';
 
 try { fs.mkdirSync(SHOTS_DIR, { recursive: true }); } catch(e) {}
 if (!fs.existsSync(CSV_FILE)) { fs.writeFileSync(CSV_FILE, 'ID,PLZ,Score,Komentar,Status,Vrijeme,Pokusaj\n'); }
@@ -34,7 +34,7 @@ try {
 } catch (e) {}
 
 if (SVI_KOMENTARI.length === 0) {
-    SVI_KOMENTARI = ['OdliÄŤan servis', 'Brzo i efikasno', 'PreporuÄŤujem', 'Sve OK', 'Top usluga', 'Hvala vam'];
+    SVI_KOMENTARI = ['Odličan servis', 'Brzo i efikasno', 'Preporučujem', 'Sve OK', 'Top usluga', 'Hvala vam'];
 }
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
@@ -64,6 +64,7 @@ const state = {
     redoslijed_count: 0,
     trenutni_id: '---',
     trenutni_plz: '---',
+    trenutni_agent: '---', // DODANO: Spremište za ime uređaja
     trenutni_score: 0,
     trenutni_korak: 'Cekanje...',
     trenutni_detalj: '',
@@ -136,6 +137,7 @@ function updateStats() {
 
 function updateLiveStatus() {
     const content = '\n' +
+        '  Uređaj: {yellow-fg}' + state.trenutni_agent + '{/}\n' + // DODANO NA VRH PANELA
         '  ID: ' + state.trenutni_id + '\n' +
         '  PLZ: ' + state.trenutni_plz + '\n' +
         '  Score: ' + state.trenutni_score + '/10\n' +
@@ -264,10 +266,20 @@ async function worker(browser, id, plz, idx, total) {
         state.trenutni_pokusaj = attempt;
 
         const page = await browser.newPage();
-        await page.setUserAgent(MOBILE_UA);
+        
+        // PROMIJENJENO: Dohvati nasumični identitet (ime + UA) iz agents.js
+        const selectedAgent = agents.getRandom();
+        state.trenutni_agent = selectedAgent.name; // FIKSIRAMO IME UREĐAJA ZA OVAJ PAKET
+        
+        await page.setUserAgent(selectedAgent.ua); 
         await page.setViewport({ width: 390, height: 844, deviceScaleFactor: 2 });
 
         try {
+            state.trenutni_korak = 'Postavljanje identiteta';
+            state.trenutni_detalj = 'Uredjaj spreman.'; 
+            updateLiveStatus();
+            await sleep(800);
+
             state.trenutni_korak = 'Ucitavanje GLS...';
             state.trenutni_detalj = 'gls-group.eu';
             updateLiveStatus();
@@ -364,11 +376,11 @@ async function worker(browser, id, plz, idx, total) {
                     continue;
                 }
 
-                state.trenutni_detalj = 'GRESKA - Nije pronaÄ‘ena ocjena';
+                state.trenutni_detalj = 'GRESKA - Nije pronadjena ocjena';
                 updateLiveStatus();
                 if (state.config.takeScreenshots) await safeShot(page, id + '_p' + attempt + '_ERROR_ocjena.png');
                 state.greske++;
-                addLog('[-]', id + ' | Ocjena nije pronaÄ‘ena (p' + attempt + ')');
+                addLog('[-]', id + ' | Ocjena nije pronadjena (p' + attempt + ')');
                 updateStats();
 
                 state.sve_ankete.push({
@@ -437,7 +449,8 @@ async function worker(browser, id, plz, idx, total) {
                 return 'GRESKA';
             }
 
-            await activePage.setUserAgent(MOBILE_UA);
+            // Ovdje također primjenjujemo isti identitet na novu stranicu ankete
+            await activePage.setUserAgent(selectedAgent.ua);
             await activePage.setViewport({ width: 390, height: 844, deviceScaleFactor: 2 });
 
             state.trenutni_detalj = 'OK - Otvorena! [' + ((Date.now() - t6) / 1000).toFixed(2) + 's]';
@@ -505,7 +518,7 @@ async function worker(browser, id, plz, idx, total) {
                     if (state.config.takeScreenshots) await safeShot(activePage, id + '_p' + attempt + '_7_comment.png');
                     addLog('[@]', 'Komentar: ' + commText.substring(0, 30));
                 } catch (e) {
-                    state.trenutni_detalj = 'GRESKA - textarea nije pronaÄ‘ena';
+                    state.trenutni_detalj = 'GRESKA - textarea nije pronadjena';
                     updateLiveStatus();
                 }
             } else {
@@ -570,7 +583,11 @@ async function worker(browser, id, plz, idx, total) {
                 });
 
                 updateStats();
-                await sleep(state.config.delaySeconds * 1000);
+                
+                // Nasumična pauza između anketa
+                const extraWait = rand(1000, 4000);
+                await sleep(state.config.delaySeconds * 1000 + extraWait);
+                
                 try { await page.close(); } catch(e){}
                 return 'ZAVRSENO';
             } else {
@@ -582,11 +599,11 @@ async function worker(browser, id, plz, idx, total) {
                     continue;
                 }
 
-                state.trenutni_detalj = 'GRESKA - Zahvalnica nije pronaÄ‘ena';
+                state.trenutni_detalj = 'GRESKA - Zahvalnica nije pronadjena';
                 updateLiveStatus();
                 if (state.config.takeScreenshots) await safeShot(page, id + '_p' + attempt + '_ERROR_zahvalnica.png');
                 state.greske++;
-                addLog('[-]', id + ' | Zahvalnica nije pronaÄ‘ena (p' + attempt + ')');
+                addLog('[-]', id + ' | Zahvalnica nije pronadjena (p' + attempt + ')');
                 updateStats();
 
                 state.sve_ankete.push({
@@ -645,14 +662,12 @@ async function worker(browser, id, plz, idx, total) {
     config.focus();
 
     config.on('keypress', async (ch, key) => {
-        // SPACE ili ENTER na polju 7 = toggle slike
         if ((key.name === 'space' || key.name === 'enter') && state.config.activeField === 7) {
             state.config.takeScreenshots = !state.config.takeScreenshots;
             updateConfigUI();
             return;
         }
 
-        // ENTER = start (polje 8 - implicitno jer je 0-7)
         if (key.name === 'enter' && state.config.activeField !== 7) {
             config.hide();
             updateStats();
@@ -676,7 +691,7 @@ async function worker(browser, id, plz, idx, total) {
                 if(i < selected.length - 1 && !forceStop) await sleep(1000);
             }
             if (currentBrowser) try { await currentBrowser.close(); } catch(e) {}
-            state.trenutni_korak = 'GOTOVO - Sve ankete su obraÄ‘ene';
+            state.trenutni_korak = 'GOTOVO - Sve ankete su obradjene';
             state.trenutni_detalj = 'Izvoz u JSON fajl...';
             updateLiveStatus();
             await sleep(2000);
@@ -685,7 +700,6 @@ async function worker(browser, id, plz, idx, total) {
             return;
         }
 
-        // LEFT = nazad
         if (key.name === 'left') {
             if (state.config.activeField === 0) {
                 forceStop = true;
@@ -698,13 +712,11 @@ async function worker(browser, id, plz, idx, total) {
             }
         }
 
-        // RIGHT = napred
         if (key.name === 'right' && state.config.activeField < 7) {
             state.config.activeField++;
             updateConfigUI();
         }
 
-        // UP/DOWN = +/-
         if (key.name === 'up' || key.name === 'down') {
             const delta = key.name === 'up' ? 1 : -1;
             if (state.config.activeField === 0) {
