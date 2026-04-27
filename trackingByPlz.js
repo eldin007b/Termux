@@ -23,7 +23,6 @@ module.exports = {
     "Z4TO0ABW",
     "ZVM55U5F",
     "ZEI1HLDC",
-    "ZONBSSW7",
     "Z4EFL3AZ",
     "Z4EFKK0Z",
     "YVMNWTKW",
