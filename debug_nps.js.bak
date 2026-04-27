@@ -1,0 +1,687 @@
+#!/usr/bin/env node
+'use strict';
+
+const blessed = require('blessed');
+const puppeteer = require('puppeteer-core');
+const fs = require('fs');
+const path = require('path');
+
+/* ================= CONFIG ================= */
+const CHROMIUM = '/data/data/com.termux/files/usr/bin/chromium-browser';
+const STORE_FILE = path.join(__dirname, 'trackingByPlz.js');
+const COMMENTS_FILE = path.join(__dirname, 'nps-com.js');
+const dateStr = new Date().toISOString().split('T')[0];
+const LOG_FILE = path.join(__dirname, `nps-log-${dateStr}.jsonl`);
+const SHOTS_DIR = path.join(__dirname, 'shots');
+
+const color = {
+  cyan: '{cyan-fg}',
+  green: '{green-fg}',
+  red: '{red-fg}',
+  yellow: '{yellow-fg}',
+  blue: '{blue-fg}',
+  gray: '{gray-fg}',
+  white: '{white-fg}',
+  end: '{/}',
+  bold: '{bold}'
+};
+
+/* ================= PRIPREMA ================= */
+if (!fs.existsSync(SHOTS_DIR)) fs.mkdirSync(SHOTS_DIR, { recursive: true });
+
+let KOMENTARI = {};
+try {
+  if (fs.existsSync(COMMENTS_FILE)) {
+    delete require.cache[require.resolve(COMMENTS_FILE)];
+    KOMENTARI = require(COMMENTS_FILE);
+  }
+} catch (e) {
+  KOMENTARI = { 10: ['Top'], 9: ['Ok'], 8: ['Passt'] };
+}
+
+/* ================= UTILS ================= */
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+const rand = (a, b) => a + Math.floor(Math.random() * (b - a + 1));
+
+function getW() {
+  const total = Math.max(screen.width - 4, 40);
+  return {
+    id: Math.floor(total * 0.22),
+    plz: Math.floor(total * 0.14),
+    score: Math.floor(total * 0.16),
+    comm: Math.floor(total * 0.14),
+    state: Math.floor(total * 0.32)
+  };
+}
+
+function P(text, width) {
+  let s = String(text || '');
+  const clean = s.replace(/{.*?}/g, '');
+  const padding = width - clean.length;
+  return s + ' '.repeat(padding > 0 ? padding : 0);
+}
+
+async function safeShot(page, filename) {
+  if (!config.screenshots) return;
+  try {
+    await Promise.race([
+      page.screenshot({ path: path.join(SHOTS_DIR, filename), fullPage: true }),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout slikanja')), 4000))
+    ]);
+  } catch (e) {}
+}
+
+function appendJsonl(file, obj) {
+  try {
+    fs.appendFileSync(file, JSON.stringify(obj) + '
+');
+  } catch (e) {}
+}
+
+/* ================= UI SETUP ================= */
+const screen = blessed.screen({
+  smartCSR: true,
+  fullUnicode: true,
+  title: 'NPS PLATINUM v26.5'
+});
+
+const header = blessed.box({
+  top: 0,
+  height: 3,
+  width: '100%',
+  align: 'center',
+  tags: true,
+  style: { bg: '#020617', fg: 'cyan', bold: true },
+  content: '
+🏆 {bold}NPS PLATINUM (SUPER SUBMITTER){/bold}'
+});
+
+const statusBar = blessed.box({
+  top: 3,
+  height: 1,
+  width: '100%',
+  tags: true,
+  style: { bg: '#0f172a', fg: 'yellow' },
+  content: ' STATUS: Spreman'
+});
+
+const activeTable = blessed.listtable({
+  top: 4,
+  left: 0,
+  width: '100%',
+  height: 5,
+  border: { type: 'line' },
+  tags: true,
+  style: {
+    border: { fg: '#334155' },
+    header: { fg: 'cyan', bold: true },
+    cell: { fg: 'white' }
+  }
+});
+
+const legend = blessed.box({
+  top: 9,
+  left: 0,
+  width: '100%',
+  height: 1,
+  tags: true,
+  style: { bg: '#020617' },
+  content: ' {green-fg}🟢 DONE{/} | {yellow-fg}🟡 SKIP{/} | {red-fg}🔴 ERROR{/} | {red-fg}← MENU{/}'
+});
+
+const logList = blessed.list({
+  top: 10,
+  left: 0,
+  right: 0,
+  bottom: 1,
+  border: { type: 'line' },
+  keys: true,
+  mouse: true,
+  tags: true,
+  scrollbar: { ch: ' ', track: { bg: '#1e293b' }, style: { bg: '#38bdf8' } },
+  style: { border: { fg: '#1e293b' }, selected: { bg: '#0f172a', bold: true } }
+});
+
+screen.append(header);
+screen.append(statusBar);
+screen.append(activeTable);
+screen.append(legend);
+screen.append(logList);
+
+function setStatus(txt) {
+  statusBar.setContent(` STATUS: ${txt}`);
+  screen.render();
+}
+
+function refreshHeaders() {
+  const W = getW();
+  const h = [
+    P('ID', W.id),
+    P('PLZ', W.plz),
+    P('SCORE', W.score),
+    P('COMM', W.comm),
+    P('STATE', W.state)
+  ];
+  activeTable.setData([h, activeTable.rows?.[1] || h.map(() => '—')]);
+  screen.render();
+}
+screen.on('resize', refreshHeaders);
+
+function setActiveRow({ id, plz, score, comm, state }) {
+  const W = getW();
+  let c = state === 'DONE' ? color.green : (state === 'ERROR' ? color.red : color.yellow);
+  const commStr = comm ? `${color.cyan}DA${color.end}` : 'NE';
+  const h = [P('ID', W.id), P('PLZ', W.plz), P('SCORE', W.score), P('COMM', W.comm), P('STATE', W.state)];
+  activeTable.setData([
+    h,
+    [
+      P(id, W.id),
+      P(plz, W.plz),
+      P(score ? `${score}/10` : '—', W.score),
+      P(commStr, W.comm),
+      `${c}${P(state, W.state)}${color.end}`
+    ]
+  ]);
+  screen.render();
+}
+
+function addLogRow(id, plz, score, comm, state) {
+  const W = getW();
+  let c = state === 'DONE' || state.startsWith('DONE') ? color.green : (state.startsWith('ERROR') ? color.red : color.yellow);
+  let icon = state === 'DONE' || state.startsWith('DONE') ? '🟢' : (state.startsWith('ERROR') ? '🔴' : '🟡');
+  const commStr = comm ? `${color.cyan}DA${color.end}` : 'NE';
+  const rowStr = `${color.white}${P(id, W.id)}${color.end}│${P(plz, W.plz)}│${P(score ? `${score}/10` : '—', W.score)}│${P(commStr, W.comm)}│${c}${icon} ${P(state, W.state - 2)}${color.end}`;
+  logList.addItem(rowStr);
+  logList.scrollTo(logList.items.length);
+  screen.render();
+}
+
+let currentBrowser = null;
+let forceStop = false;
+
+/* ================= HELPERS ================= */
+async function launchBrowser() {
+  return await puppeteer.launch({
+    executablePath: CHROMIUM,
+    headless: 'new',
+    args: [
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-gpu',
+      '--disable-dev-shm-usage',
+      '--no-zygote',
+      '--single-process',
+      '--disable-blink-features=AutomationControlled'
+    ]
+  });
+}
+
+async function exitToMenu() {
+  forceStop = true;
+  setStatus('Zatvaram...');
+  if (currentBrowser) {
+    try { await currentBrowser.close(); } catch (e) {}
+  }
+  await sleep(500);
+  screen.destroy();
+  process.exit(0);
+}
+
+screen.key(['q', 'escape', 'C-c'], async () => { await exitToMenu(); });
+
+async function dismissCookieStuff(page) {
+  try {
+    await page.evaluate(() => {
+      try {
+        ['onetrust-accept-btn-handler', 's-all-bn'].forEach(i => {
+          const b = document.getElementById(i) || document.querySelector(`#${i}`);
+          if (b) b.click();
+        });
+        ['onetrust-banner-sdk', 'onetrust-consent-sdk'].forEach(i => {
+          const b = document.getElementById(i);
+          if (b) b.remove();
+        });
+      } catch (e) {}
+    });
+  } catch (e) {}
+}
+
+async function detectSurveyStage(pageOrTab) {
+  try {
+    for (const frame of pageOrTab.frames()) {
+      try {
+        const info = await frame.evaluate(() => {
+          const text = (document.body?.innerText || '').trim();
+
+          const hasRadios = document.querySelectorAll('input[type="radio"]').length > 0;
+          const hasTextarea = document.querySelectorAll('textarea').length > 0;
+
+          const ratingLike =
+            /weiterempfehlen|wahrscheinlich|antwort aus|bitte wählen/i.test(text) || hasRadios;
+
+          const commentLike =
+            /positives feedback|was hat ihnen besonders gut gefallen|kommentar/i.test(text) || hasTextarea;
+
+          const successLike =
+            /vielen dank|danke für ihre zeit|ihr feedback hilft uns/i.test(text);
+
+          const requiredLike =
+            /bitte beantworten|erforderlich|pflichtfeld/i.test(text);
+
+          return {
+            ratingLike,
+            commentLike,
+            successLike,
+            requiredLike,
+            text: text.slice(0, 1200)
+          };
+        });
+
+        if (info.successLike) return { stage: 'SUCCESS', frame };
+        if (info.requiredLike) return { stage: 'REQUIRED', frame };
+        if (info.commentLike) return { stage: 'COMMENT', frame };
+        if (info.ratingLike) return { stage: 'RATING', frame };
+      } catch (e) {}
+    }
+  } catch (e) {}
+
+  return { stage: 'UNKNOWN', frame: null };
+}
+
+async function findSurveyTab(browser, fallbackPage) {
+  try {
+    for (let i = 0; i < 8; i++) {
+      const pages = await browser.pages();
+      for (const p of pages) {
+        try {
+          const url = await p.url();
+          if (url.includes('questionpro') || url.includes('TakeSurvey')) {
+            await p.bringToFront();
+            return p;
+          }
+        } catch (e) {}
+      }
+      await sleep(1000);
+    }
+  } catch (e) {}
+  return fallbackPage;
+}
+
+async function waitForManualSurveyCompletion(activePage, id, idx, total) {
+  setStatus(`[${idx}/${total}] Anketa otvorena - ručni unos...`);
+
+  const maxWaitSec = 180;
+
+  for (let i = 0; i < maxWaitSec; i++) {
+    if (forceStop) return 'SKIP';
+
+    const res = await detectSurveyStage(activePage);
+
+    if (res.stage === 'RATING') {
+      setStatus(`[${idx}/${total}] Ručno odaberi ocjenu i idi dalje...`);
+    } else if (res.stage === 'COMMENT') {
+      setStatus(`[${idx}/${total}] Ručno unesi komentar i klikni Fertig...`);
+    } else if (res.stage === 'SUCCESS') {
+      await safeShot(activePage, `${id}_manual_success.png`);
+      return 'DONE';
+    } else if (res.stage === 'REQUIRED') {
+      setStatus(`[${idx}/${total}] Obavezno polje nije popunjeno - dovrši ručno...`);
+    } else {
+      setStatus(`[${idx}/${total}] Čekam ručni završetak ankete...`);
+    }
+
+    if (config.screenshots && i > 0 && i % 20 === 0) {
+      await safeShot(activePage, `${id}_manual_wait_${i}.png`);
+    }
+
+    await sleep(1000);
+  }
+
+  await safeShot(activePage, `${id}_manual_timeout.png`);
+  return 'SKIP';
+}
+
+/* ================= WORKER (CORE LOGIC) ================= */
+async function worker(browser, id, plz, idx, total) {
+  if (forceStop || !browser) return 'ERROR';
+
+  const page = await browser.newPage();
+  await page.setUserAgent('Mozilla/5.0 (Linux; Android 13; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36');
+  await page.setViewport({ width: 390, height: 844, isMobile: true });
+
+  await page.setRequestInterception(true);
+  page.on('request', req => {
+    ['image', 'font', 'media'].includes(req.resourceType()) ? req.abort() : req.continue();
+  });
+
+  const score = [9, 10][Math.floor(Math.random() * 2)];
+  const commText = (Math.random() < 0.15 && KOMENTARI[score])
+    ? KOMENTARI[score][Math.floor(Math.random() * KOMENTARI[score].length)]
+    : null;
+
+  setActiveRow({ id, plz, score, comm: !!commText, state: '...' });
+
+  try {
+    setStatus(`[${idx}/${total}] Otvaram paket...`);
+    await page.goto(`https://gls-group.eu/AT/de/paket-verfolgen/?match=${id}`, {
+      waitUntil: 'domcontentloaded',
+      timeout: 35000
+    });
+
+    await sleep(1500);
+    await dismissCookieStuff(page);
+    await sleep(800);
+    await safeShot(page, `${id}_1_pocetak.png`);
+
+    setStatus(`[${idx}/${total}] Unosim PLZ...`);
+    await page.waitForSelector('#witt002_details_postalcode_input', { timeout: 6000 });
+    await page.type('#witt002_details_postalcode_input', String(plz), { delay: rand(40, 80) });
+    await safeShot(page, `${id}_2_plz_unesen.png`);
+    await page.keyboard.press('Enter');
+
+    setStatus(`[${idx}/${total}] Čekam status...`);
+    await sleep(4000);
+
+    setStatus(`[${idx}/${total}] Tražim anketu...`);
+    await page.evaluate(() => window.scrollBy(0, 500));
+    await sleep(2000);
+    await safeShot(page, `${id}_3_status_paketa.png`);
+
+    const isDelivered = await page.evaluate(() => {
+      return /Zugestellt|Delivered/i.test(document.body.innerText || '');
+    });
+
+    if (!isDelivered) {
+      setActiveRow({ id, plz, score, comm: !!commText, state: 'SKIP' });
+      addLogRow(id, plz, score, !!commText, 'SKIP (NIJE ISPORUČENO)');
+      return 'SKIP';
+    }
+
+    setStatus(`[${idx}/${total}] Tražim ulaz u anketu...`);
+
+    let clickedSurveyEntry = false;
+    for (const frame of page.frames()) {
+      try {
+        const handles = await frame.$$('a, button, div, span, li, label');
+        for (let handle of handles) {
+          try {
+            const text = await frame.evaluate(el => (el.innerText || '').trim(), handle);
+            if (/9|10/.test(text) || /feedback|survey|umfrage/i.test(text)) {
+              const box = await handle.boundingBox();
+              if (box && box.width >= 10 && box.width <= 200 && box.height >= 10 && box.height <= 100) {
+                await handle.evaluate(el => el.scrollIntoView({ behavior: 'instant', block: 'center' }));
+                await sleep(700);
+                await handle.click();
+                clickedSurveyEntry = true;
+                break;
+              }
+            }
+          } catch (e) {}
+        }
+        if (clickedSurveyEntry) break;
+      } catch (e) {}
+    }
+
+    if (!clickedSurveyEntry) {
+      setActiveRow({ id, plz, score, comm: !!commText, state: 'SKIP' });
+      addLogRow(id, plz, score, !!commText, 'SKIP (NEMA ANKETE)');
+      return 'SKIP';
+    }
+
+    setStatus(`[${idx}/${total}] Čekam otvaranje ankete...`);
+    await sleep(6500);
+
+    let activePage = await findSurveyTab(browser, page);
+    await safeShot(activePage, `${id}_4_anketa_otvorena.png`);
+
+    const activeUrl = await activePage.url();
+    if (!activeUrl.includes('questionpro') && !activeUrl.includes('TakeSurvey')) {
+      setActiveRow({ id, plz, score, comm: !!commText, state: 'SKIP' });
+      addLogRow(id, plz, score, !!commText, 'SKIP (NIJE OTVORIO ANKETU)');
+      if (activePage !== page) {
+        try { await activePage.close(); } catch (e) {}
+      }
+      return 'SKIP';
+    }
+
+    try {
+      await activePage.evaluate(() => {
+        try {
+          const btns = Array.from(document.querySelectorAll('a, button'));
+          for (const b of btns) {
+            const t = (b.innerText || '').toLowerCase();
+            if (t.includes('akzeptieren') || t.includes('accept all') || t.includes('zustimmen')) b.click();
+          }
+          document.querySelectorAll('.cookie-banner, #cookie-banner, .cc-window').forEach(b => b.remove());
+        } catch (e) {}
+      });
+    } catch (e) {}
+
+    await sleep(1000);
+
+    if (config.manualPause) {
+      setStatus(`[${idx}/${total}] Anketa spremna za ručni unos...`);
+
+      const manualResult = await waitForManualSurveyCompletion(activePage, id, idx, total);
+
+      if (activePage !== page) {
+        try { await activePage.close(); } catch (e) {}
+      }
+
+      if (manualResult === 'DONE') {
+        appendJsonl(LOG_FILE, {
+          id,
+          plz,
+          score,
+          date: new Date().toISOString(),
+          mode: 'manual'
+        });
+        setActiveRow({ id, plz, score, comm: !!commText, state: 'DONE' });
+        addLogRow(id, plz, score, !!commText, 'DONE (RUČNO)');
+        return 'DONE';
+      } else {
+        setActiveRow({ id, plz, score, comm: !!commText, state: 'SKIP' });
+        addLogRow(id, plz, score, !!commText, 'SKIP (RUČNI TIMEOUT)');
+        return 'SKIP';
+      }
+    }
+
+    setActiveRow({ id, plz, score, comm: !!commText, state: 'SKIP' });
+    addLogRow(id, plz, score, !!commText, 'SKIP (AUTO OFF)');
+    if (activePage !== page) {
+      try { await activePage.close(); } catch (e) {}
+    }
+    return 'SKIP';
+  } catch (e) {
+    await safeShot(page, `${id}_GRESKA.png`);
+    setActiveRow({ id, plz, score, comm: !!commText, state: 'ERROR' });
+    addLogRow(id, plz, score, !!commText, `ERROR`);
+    appendJsonl(LOG_FILE, {
+      id,
+      plz,
+      error: e.message,
+      date: new Date().toISOString()
+    });
+    return 'ERROR';
+  } finally {
+    try { await page.close(); } catch (e) {}
+  }
+}
+
+/* ================= SETTINGS UI ================= */
+const selector = blessed.box({
+  parent: screen,
+  top: 'center',
+  left: 'center',
+  width: 56,
+  height: 20,
+  border: 'line',
+  label: ' {cyan-fg}KONFIGURACIJA{/cyan-fg} ',
+  tags: true,
+  hidden: true,
+  style: { border: { fg: 'cyan' }, bg: '#020617' }
+});
+
+let config = {
+  npsCount: 1,
+  minTime: 20,
+  maxTime: 60,
+  screenshots: false,
+  manualPause: true,
+  activeField: 0
+};
+
+function updateSelector() {
+  const c = config;
+  const fmt = (idx, val, unit = '') =>
+    c.activeField === idx
+      ? `{black-bg}{yellow-fg}{bold} < ${val}${unit} > {/bold}{/yellow-fg}{/black-bg}`
+      : `  ${val}${unit}  `;
+
+  const fmtToggle = (idx, val) =>
+    c.activeField === idx
+      ? `{black-bg}{yellow-fg}{bold} < ${val ? 'DA' : 'NE'} > {/bold}{/yellow-fg}{/black-bg}`
+      : `  ${val ? 'DA' : 'NE'}  `;
+
+  const startBtn =
+    c.activeField === 5
+      ? `{black-bg}{green-fg}{bold} [ POKRENI SADA ] {/bold}{/green-fg}{/black-bg}`
+      : `  [ POKRENI SADA ]  `;
+
+  selector.setContent(
+`
+  Broj anketa:       ${fmt(0, c.npsCount)}
+
+  Min. čekanje:      ${fmt(1, c.minTime, 's')}
+
+  Max. čekanje:      ${fmt(2, c.maxTime, 's')}
+
+  Slikanje (Dokazi): ${fmtToggle(3, c.screenshots)}
+
+  Manual Pause:      ${fmtToggle(4, c.manualPause)}
+
+      ${startBtn}
+
+  {gray-fg}↑/↓: +/-   ←/→: Navigacija   Enter: START{/gray-fg}`
+  );
+
+  screen.render();
+}
+
+/* ================= MAIN ================= */
+(async () => {
+  refreshHeaders();
+  selector.show();
+  selector.focus();
+  updateSelector();
+
+  selector.on('keypress', async (ch, key) => {
+    if (key.name === 'enter' || (key.name === 'right' && config.activeField === 5)) {
+      if (config.activeField === 3) {
+        config.screenshots = !config.screenshots;
+        updateSelector();
+        return;
+      }
+
+      if (config.activeField === 4) {
+        config.manualPause = !config.manualPause;
+        updateSelector();
+        return;
+      }
+
+      selector.hide();
+      setStatus('Pokrećem pretraživač...');
+
+      try {
+        currentBrowser = await launchBrowser();
+        setStatus('Čitam bazu...');
+
+        if (!fs.existsSync(STORE_FILE)) {
+          setStatus('{red-fg}GREŠKA: Nema baze (trackingByPlz.js)!{/}');
+          await sleep(3000);
+          await exitToMenu();
+          return;
+        }
+
+        try { delete require.cache[require.resolve(STORE_FILE)]; } catch (e) {}
+        const store = require(STORE_FILE);
+
+        let all = [];
+        for (let p in store) {
+          if (Array.isArray(store[p])) {
+            store[p].forEach(id => all.push({ id, p }));
+          }
+        }
+
+        if (all.length === 0) {
+          setStatus('{yellow-fg}Baza je prazna, nemam paketa!{/}');
+          await sleep(3000);
+          await exitToMenu();
+          return;
+        }
+
+        const selected = all.sort(() => 0.5 - Math.random()).slice(0, config.npsCount);
+
+        for (let i = 0; i < selected.length; i++) {
+          if (forceStop) break;
+
+          const res = await worker(currentBrowser, selected[i].id, selected[i].p, i + 1, selected.length);
+
+          if (res === 'DONE' && store[selected[i].p]) {
+            store[selected[i].p] = store[selected[i].p].filter(x => x !== selected[i].id);
+            fs.writeFileSync(STORE_FILE, `module.exports = ${JSON.stringify(store, null, 2)};`);
+          }
+
+          if (i < selected.length - 1 && !forceStop) {
+            for (let j = rand(config.minTime, config.maxTime); j > 0; j--) {
+              if (forceStop) break;
+              setStatus(`Čekanje · ${color.yellow}${j}s${color.end}`);
+              await sleep(1000);
+            }
+          }
+        }
+
+        await exitToMenu();
+      } catch (err) {
+        setStatus(`{red-fg}KRAŠ: ${err.message}{/}`);
+        await sleep(5000);
+        await exitToMenu();
+      }
+    }
+
+    if (key.name === 'right' && config.activeField < 5) {
+      config.activeField++;
+      updateSelector();
+    }
+
+    if (key.name === 'left') {
+      if (config.activeField === 0) {
+        await exitToMenu();
+      } else {
+        config.activeField--;
+        updateSelector();
+      }
+    }
+
+    if (key.name === 'up' || key.name === 'down') {
+      if (config.activeField === 5) return;
+
+      const delta = key.name === 'up' ? 1 : -1;
+
+      if (config.activeField === 0) {
+        config.npsCount = Math.max(1, config.npsCount + delta);
+      } else if (config.activeField === 1) {
+        config.minTime = Math.max(1, config.minTime + (delta * 5));
+        if (config.minTime > config.maxTime) config.maxTime = config.minTime;
+      } else if (config.activeField === 2) {
+        config.maxTime = Math.max(config.minTime, config.maxTime + (delta * 5));
+      } else if (config.activeField === 3) {
+        config.screenshots = !config.screenshots;
+      } else if (config.activeField === 4) {
+        config.manualPause = !config.manualPause;
+      }
+
+      updateSelector();
+    }
+  });
+})();
