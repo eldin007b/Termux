@@ -2,7 +2,6 @@ name: GLS Scraper
 
 on:
   workflow_dispatch:
-  schedule:
   
 jobs:
   scrape:
